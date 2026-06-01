@@ -38,8 +38,11 @@ from ..util.source_reader import SourceReaderError, read_source
 
 logger = get_logger(__name__)
 
-# Default timeout for indexing (10 minutes)
-DEFAULT_INDEX_TIMEOUT = 600.0
+# Default timeout for foreground indexing (30 minutes). MCP clients may impose
+# shorter call timeouts, so index_repo runs indexing in the background by default.
+DEFAULT_INDEX_TIMEOUT = 1800.0
+STALE_INDEXING_SECONDS = 300.0
+_BACKGROUND_INDEX_TASKS: set[asyncio.Task] = set()
 
 
 def _detect_git_branch(cwd: str) -> str | None:
@@ -183,7 +186,7 @@ def create_server(
                         "• GITHUB: pass `repo` in owner/repo format to clone from GitHub and index.\n\n"
                         "Parses every function/class/method, generates semantic embeddings, and builds "
                         "a call graph. Safe to re-run — already-indexed repos are detected. "
-                        "Indexing takes 1-5 minutes depending on size."
+                        "Indexing starts in the background by default so MCP clients do not time out."
                     ),
                     inputSchema={
                         "type": "object",
@@ -207,8 +210,16 @@ def create_server(
                             },
                             "timeout": {
                                 "type": "number",
-                                "description": "Timeout in seconds. Default: 600 (10 min). Large repos may need more.",
-                                "default": 600,
+                                "description": "Foreground timeout in seconds when background=false. Default: 1800 (30 min).",
+                                "default": 1800,
+                            },
+                            "background": {
+                                "type": "boolean",
+                                "description": (
+                                    "Run indexing asynchronously and return as soon as it starts. "
+                                    "Default: true."
+                                ),
+                                "default": True,
                             },
                             "force": {
                                 "type": "boolean",
@@ -491,6 +502,165 @@ def create_server(
 # --- Tool handlers ---
 
 
+def _bool_argument(arguments: dict, name: str, default: bool) -> bool:
+    value = arguments.get(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
+def _index_timeout(arguments: dict) -> float:
+    timeout = arguments.get("timeout", DEFAULT_INDEX_TIMEOUT)
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
+        timeout = DEFAULT_INDEX_TIMEOUT
+    return min(float(timeout), 7200.0)
+
+
+def _is_stale_in_progress(record: ProjectRecord | None) -> bool:
+    if record is None or record.status not in ("indexing", "cloning"):
+        return False
+    timestamp = record.last_indexed_at or record.created_at
+    try:
+        started = datetime.fromisoformat(timestamp)
+    except (TypeError, ValueError):
+        return False
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - started).total_seconds()
+    return age > STALE_INDEXING_SECONDS
+
+
+def _detect_and_save_repo_metadata(metadata, project_id: str, local_path: str) -> None:
+    all_files: list[str] = []
+    for root, _dirs, files in os.walk(local_path):
+        for fname in files:
+            all_files.append(os.path.join(root, fname))
+    meta = detect_repo_metadata(local_path, all_files)
+    metadata.update_project_metadata(
+        project_id,
+        description=meta["description"],
+        primary_language=meta["primary_language"],
+        tags=meta["tags"],
+    )
+
+
+async def _run_index_pipeline(container, metadata, local_path: str, project_id: str) -> dict:
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            None, lambda: container.indexer.index(local_path, project_id=project_id)
+        )
+    except Exception as e:
+        metadata.update_project_status(project_id, "error", error_message=str(e))
+        raise
+
+    if result["status"] == "success":
+        entity_count = result["functions_indexed"]
+        metadata.update_project_status(project_id, "ready", entity_count=entity_count)
+        try:
+            _detect_and_save_repo_metadata(metadata, project_id, local_path)
+        except Exception:
+            logger.warning(
+                "Failed to detect/save repo metadata for %s", project_id, exc_info=True
+            )
+    else:
+        error_msg = result.get("error", "Unknown")
+        metadata.update_project_status(project_id, "error", error_message=error_msg)
+    return result
+
+
+async def _run_github_index_pipeline(
+    container,
+    metadata,
+    repo_manager,
+    clone_url: str,
+    repo: str,
+    branch: str | None,
+    project_id: str,
+    force_delete_clone: bool = False,
+) -> dict:
+    loop = asyncio.get_running_loop()
+    try:
+        metadata.update_project_status(project_id, "cloning")
+        if force_delete_clone and repo_manager.exists(repo, branch):
+            try:
+                await loop.run_in_executor(None, lambda: repo_manager.delete(repo, branch))
+            except Exception:
+                logger.warning(
+                    "Failed to delete existing clone for %s during force re-index",
+                    repo,
+                    exc_info=True,
+                )
+        local_path = await loop.run_in_executor(
+            None, lambda: repo_manager.clone(clone_url, repo, branch=branch)
+        )
+        metadata.update_project_local_path(project_id, local_path)
+        metadata.update_project_status(project_id, "indexing")
+    except Exception as e:
+        metadata.update_project_status(project_id, "error", error_message=str(e))
+        raise
+
+    return await _run_index_pipeline(container, metadata, local_path, project_id)
+
+
+def _start_background_index(container, metadata, local_path: str, project_id: str) -> None:
+    task = asyncio.create_task(
+        _run_index_pipeline(container, metadata, local_path, project_id)
+    )
+    _BACKGROUND_INDEX_TASKS.add(task)
+
+    def _log_background_result(done: asyncio.Task) -> None:
+        _BACKGROUND_INDEX_TASKS.discard(done)
+        if done.cancelled():
+            logger.warning("Background indexing was cancelled for %s", project_id)
+            return
+        try:
+            done.result()
+        except Exception:
+            logger.exception("Background indexing failed for %s", project_id)
+
+    task.add_done_callback(_log_background_result)
+
+
+def _start_background_github_index(
+    container,
+    metadata,
+    repo_manager,
+    clone_url: str,
+    repo: str,
+    branch: str | None,
+    project_id: str,
+    force_delete_clone: bool = False,
+) -> None:
+    task = asyncio.create_task(
+        _run_github_index_pipeline(
+            container,
+            metadata,
+            repo_manager,
+            clone_url,
+            repo,
+            branch,
+            project_id,
+            force_delete_clone=force_delete_clone,
+        )
+    )
+    _BACKGROUND_INDEX_TASKS.add(task)
+
+    def _log_background_result(done: asyncio.Task) -> None:
+        _BACKGROUND_INDEX_TASKS.discard(done)
+        if done.cancelled():
+            logger.warning("Background GitHub indexing was cancelled for %s", project_id)
+            return
+        try:
+            done.result()
+        except Exception:
+            logger.exception("Background GitHub indexing failed for %s", project_id)
+
+    task.add_done_callback(_log_background_result)
+
+
 async def _handle_index_local_path(arguments, container, metadata):
     """Index a folder already on disk — no clone, no network."""
     import re as _re
@@ -520,14 +690,13 @@ async def _handle_index_local_path(arguments, container, metadata):
     branch = branch or None
 
     force = bool(arguments.get("force", False))
-    timeout = arguments.get("timeout", DEFAULT_INDEX_TIMEOUT)
-    if not isinstance(timeout, (int, float)) or timeout <= 0:
-        timeout = DEFAULT_INDEX_TIMEOUT
-    timeout = min(timeout, 3600)
+    background = _bool_argument(arguments, "background", True)
+    timeout = _index_timeout(arguments)
 
     project_id = _make_project_id(repo_full_name, branch)
 
     existing = metadata.get_project(project_id)
+    stale_existing = _is_stale_in_progress(existing)
     if existing and not force:
         if existing.status == "ready":
             return [
@@ -536,7 +705,7 @@ async def _handle_index_local_path(arguments, container, metadata):
                     text=f"Already indexed: {repo_full_name} ({existing.entity_count} entities) at {existing.local_path}",
                 )
             ]
-        if existing.status in ("indexing", "cloning"):
+        if existing.status in ("indexing", "cloning") and not stale_existing:
             return [
                 TextContent(
                     type="text",
@@ -544,7 +713,9 @@ async def _handle_index_local_path(arguments, container, metadata):
                 )
             ]
 
-    if existing and force:
+    if existing and (force or stale_existing):
+        if stale_existing and not force:
+            logger.warning("Replacing stale indexing record for %s", project_id)
         try:
             container.store.clear(project_id)
         except Exception:
@@ -568,12 +739,22 @@ async def _handle_index_local_path(arguments, container, metadata):
         )
     )
 
+    if background:
+        _start_background_index(container, metadata, abs_path, project_id)
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    f"Started indexing {repo_full_name} in the background.\n"
+                    f"Source: {abs_path}\n"
+                    "Use list_repos to check when status becomes ready."
+                ),
+            )
+        ]
+
     try:
-        loop = asyncio.get_running_loop()
         result = await asyncio.wait_for(
-            loop.run_in_executor(
-                None, lambda: container.indexer.index(abs_path, project_id=project_id)
-            ),
+            _run_index_pipeline(container, metadata, abs_path, project_id),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
@@ -613,7 +794,6 @@ async def _handle_index_local_path(arguments, container, metadata):
         )
     else:
         error_msg = result.get("error", "Unknown")
-        metadata.update_project_status(project_id, "error", error_message=error_msg)
         text = f"Error indexing {abs_path}: {error_msg}"
 
     return [TextContent(type="text", text=text)]
@@ -640,16 +820,15 @@ async def _handle_index_repo(
 
     branch = arguments.get("branch", "").strip() or None
 
-    timeout = arguments.get("timeout", DEFAULT_INDEX_TIMEOUT)
-    if not isinstance(timeout, (int, float)) or timeout <= 0:
-        timeout = DEFAULT_INDEX_TIMEOUT
-    timeout = min(timeout, 3600)
+    background = _bool_argument(arguments, "background", True)
+    timeout = _index_timeout(arguments)
 
     force = bool(arguments.get("force", False))
     project_id = _make_project_id(repo, branch)
 
     # Check if already indexed or in progress (exact match)
     existing = metadata.get_project(project_id)
+    stale_existing = _is_stale_in_progress(existing)
     if existing and not force:
         if existing.status == "ready":
             return [
@@ -658,7 +837,7 @@ async def _handle_index_repo(
                     text=f"Already indexed: {repo} ({existing.entity_count} entities)",
                 )
             ]
-        if existing.status in ("indexing", "cloning"):
+        if existing.status in ("indexing", "cloning") and not stale_existing:
             return [
                 TextContent(
                     type="text",
@@ -667,8 +846,11 @@ async def _handle_index_repo(
             ]
 
     # When force=True, wipe the existing index so we start clean.
-    if existing and force:
-        logger.info("force re-index requested for %s — clearing existing index", repo)
+    if existing and (force or stale_existing):
+        if force:
+            logger.info("force re-index requested for %s — clearing existing index", repo)
+        else:
+            logger.warning("Replacing stale indexing record for %s", project_id)
         try:
             container.store.clear(project_id)
         except Exception:
@@ -702,6 +884,43 @@ async def _handle_index_repo(
     # Clone the repo (public GitHub URL only — no auth)
     try:
         clone_url = f"https://github.com/{repo}.git"
+
+        if background:
+            try:
+                local_path = repo_manager.repo_path(repo, branch)
+            except Exception:
+                local_path = repo_manager.repo_path(repo, None)
+            now = datetime.now(timezone.utc).isoformat()
+            metadata.save_project(
+                ProjectRecord(
+                    project_id=project_id,
+                    repo_full_name=repo,
+                    branch=branch,
+                    local_path=local_path,
+                    status="cloning",
+                    created_at=now,
+                    org_id=None,
+                )
+            )
+            _start_background_github_index(
+                container,
+                metadata,
+                repo_manager,
+                clone_url,
+                repo,
+                branch,
+                project_id,
+                force_delete_clone=force,
+            )
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Started cloning and indexing {repo} in the background.\n"
+                        "Use list_repos to check when status becomes ready."
+                    ),
+                )
+            ]
 
         # When force=True, delete existing clone so we perform a fresh full clone.
         loop = asyncio.get_running_loop()
@@ -760,11 +979,8 @@ async def _handle_index_repo(
 
     # Index
     try:
-        loop = asyncio.get_running_loop()
         result = await asyncio.wait_for(
-            loop.run_in_executor(
-                None, lambda: container.indexer.index(local_path, project_id=project_id)
-            ),
+            _run_index_pipeline(container, metadata, local_path, project_id),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
@@ -778,31 +994,10 @@ async def _handle_index_repo(
 
     if result["status"] == "success":
         entity_count = result["functions_indexed"]
-        metadata.update_project_status(project_id, "ready", entity_count=entity_count)
-        # Detect and store repo metadata (language, tags, description)
-        try:
-            import os as _os
-
-            all_files: list[str] = []
-            for root, _dirs, files in _os.walk(local_path):
-                for fname in files:
-                    all_files.append(_os.path.join(root, fname))
-            meta = detect_repo_metadata(local_path, all_files)
-            metadata.update_project_metadata(
-                project_id,
-                description=meta["description"],
-                primary_language=meta["primary_language"],
-                tags=meta["tags"],
-            )
-        except Exception:
-            logger.warning(
-                "Failed to detect/save repo metadata for %s", project_id, exc_info=True
-            )
         inc = " (incremental)" if result.get("incremental") else ""
         text = f"Indexed {repo}: {entity_count} functions from {result['files_processed']} files{inc}"
     else:
         error_msg = result.get("error", "Unknown")
-        metadata.update_project_status(project_id, "error", error_message=error_msg)
         text = f"Error indexing {repo}: {error_msg}"
 
     return [TextContent(type="text", text=text)]

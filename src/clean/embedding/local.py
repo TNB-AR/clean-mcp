@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import threading
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
-from sentence_transformers import SentenceTransformer
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
 
 from ..core.config import EmbedderConfig
 from ..util.logging import get_logger
@@ -33,6 +35,12 @@ class SentenceTransformerEmbedder:
         with self._lock:
             # Double-check after acquiring lock
             if self._model is None:
+                if not self._config.show_progress_bar:
+                    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+                    os.environ.setdefault("TQDM_DISABLE", "1")
+
+                from sentence_transformers import SentenceTransformer
+
                 logger.info("Loading embedding model '%s'...", self._config.model_name)
                 self._model = SentenceTransformer(self._config.model_name)
                 logger.info("Embedding model ready")

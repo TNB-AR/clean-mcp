@@ -6,10 +6,10 @@ import json
 import os
 import re
 import threading
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
-import lancedb
-import pyarrow as pa
+if TYPE_CHECKING:
+    import lancedb
 
 from ..core.config import StorageConfig
 from ..core.errors import StorageError
@@ -19,30 +19,42 @@ from ..util.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Schema for the entities table
-ENTITY_SCHEMA = pa.schema(
-    [
-        pa.field("id", pa.utf8()),
-        pa.field("project_id", pa.utf8()),
-        pa.field("name", pa.utf8()),
-        pa.field("file_path", pa.utf8()),
-        pa.field("code", pa.utf8()),
-        pa.field("line_start", pa.int32()),
-        pa.field("line_end", pa.int32()),
-        pa.field("language", pa.utf8()),
-        pa.field("kind", pa.utf8()),
-        pa.field("calls", pa.utf8()),  # JSON-encoded list
-        pa.field("called_by", pa.utf8()),  # JSON-encoded list
-        pa.field("class_name", pa.utf8()),
-        pa.field("exported", pa.bool_()),
-        pa.field("sub_kind", pa.utf8()),  # nullable; empty string means None
-        pa.field("decorators", pa.utf8()),  # JSON-encoded list, nullable
-        pa.field("vector", pa.list_(pa.float32())),
-        pa.field("chunk_index", pa.int32()),  # 0 for non-chunked
-        pa.field("parent_id", pa.utf8()),  # "" when not a chunk
-        pa.field("total_chunks", pa.int32()),  # 0 for non-chunked
-    ]
-)
+def _get_pyarrow():
+    import pyarrow as pa
+
+    return pa
+
+
+def _entity_schema(dimension: int | None = None):
+    pa = _get_pyarrow()
+    vector_type = (
+        pa.list_(pa.float32(), dimension)
+        if dimension is not None
+        else pa.list_(pa.float32())
+    )
+    return pa.schema(
+        [
+            pa.field("id", pa.utf8()),
+            pa.field("project_id", pa.utf8()),
+            pa.field("name", pa.utf8()),
+            pa.field("file_path", pa.utf8()),
+            pa.field("code", pa.utf8()),
+            pa.field("line_start", pa.int32()),
+            pa.field("line_end", pa.int32()),
+            pa.field("language", pa.utf8()),
+            pa.field("kind", pa.utf8()),
+            pa.field("calls", pa.utf8()),  # JSON-encoded list
+            pa.field("called_by", pa.utf8()),  # JSON-encoded list
+            pa.field("class_name", pa.utf8()),
+            pa.field("exported", pa.bool_()),
+            pa.field("sub_kind", pa.utf8()),  # nullable; empty string means None
+            pa.field("decorators", pa.utf8()),  # JSON-encoded list, nullable
+            pa.field("vector", vector_type),
+            pa.field("chunk_index", pa.int32()),  # 0 for non-chunked
+            pa.field("parent_id", pa.utf8()),  # "" when not a chunk
+            pa.field("total_chunks", pa.int32()),  # 0 for non-chunked
+        ]
+    )
 
 
 def _escape_lance(value: str) -> str:
@@ -81,6 +93,8 @@ class LanceDBStore:
         """Get or create a LanceDB connection for a project."""
         with self._lock:
             if self._db is None:
+                import lancedb
+
                 db_path = self._config.default_persist_path
                 os.makedirs(db_path, exist_ok=True)
                 self._db = lancedb.connect(db_path)
@@ -123,11 +137,7 @@ class LanceDBStore:
         existing_tables = self._list_tables(db)
         if name not in existing_tables:
             # Create empty table with schema
-            schema = ENTITY_SCHEMA.set(
-                ENTITY_SCHEMA.get_field_index("vector"),
-                pa.field("vector", pa.list_(pa.float32(), dimension)),
-            )
-            table = db.create_table(name, schema=schema)
+            table = db.create_table(name, schema=_entity_schema(dimension))
             self._tables[name] = table
             logger.info("Created table '%s' with dimension %d", name, dimension)
         else:
@@ -647,11 +657,7 @@ class LanceDBStore:
                 db.drop_table(rebuild_name)
                 self._tables.pop(rebuild_name, None)
 
-            schema = ENTITY_SCHEMA.set(
-                ENTITY_SCHEMA.get_field_index("vector"),
-                pa.field("vector", pa.list_(pa.float32(), dimension)),
-            )
-            table = db.create_table(rebuild_name, schema=schema)
+            table = db.create_table(rebuild_name, schema=_entity_schema(dimension))
             self._tables[rebuild_name] = table
             logger.info("Created rebuild table '%s' (dim=%d)", rebuild_name, dimension)
 
@@ -792,6 +798,7 @@ class LanceDBStore:
             arrow_data = src_entity_table.to_arrow()
 
             if arrow_data.num_rows > 0:
+                pa = _get_pyarrow()
                 pid_col = pa.array(
                     [dest_project_id] * arrow_data.num_rows, type=pa.utf8()
                 )
@@ -844,6 +851,7 @@ class LanceDBStore:
             state_arrow = src_state_table.to_arrow()
 
             if state_arrow.num_rows > 0:
+                pa = _get_pyarrow()
                 # Rewrite project_id column.
                 pid_col = pa.array(
                     [dest_project_id] * state_arrow.num_rows, type=pa.utf8()

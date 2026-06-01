@@ -1,8 +1,8 @@
-  {
-    "mcpServers": {
-      "clean": {
-        "type": "sse",
-        "url": "http://127.0.0.1:8000/mcp/sse"
-      }
+{
+  "mcpServers": {
+    "clean": {
+      "command": "python",
+      "args": ["-m", "clean.local.mcp_server"]
     }
   }
+}

@@ -50,12 +50,14 @@ class IndexerConfig:
 class EmbedderConfig:
     model_name: str = "all-MiniLM-L6-v2"
     embedding_dimensions: int = 384
-    show_progress_bar: bool = True
+    show_progress_bar: bool = False
 
 
 @dataclass
 class StorageConfig:
-    default_persist_dir: str = ""  # empty -> ~/.clean/index (set in default_persist_path)
+    default_persist_dir: str = (
+        ""  # empty -> ~/.clean/index (set in default_persist_path)
+    )
     uri: str = ""  # LanceDB URI; empty = local
 
     @property
@@ -63,6 +65,7 @@ class StorageConfig:
         if self.default_persist_dir:
             return self.default_persist_dir
         from pathlib import Path
+
         return str(Path.home() / ".clean" / "index")
 
 
@@ -122,6 +125,14 @@ class CleanConfig:
                 config.embedder.embedding_dimensions = int(dim)
             except ValueError:
                 pass
+
+        if progress := os.getenv("CLEAN_SHOW_PROGRESS_BAR"):
+            config.embedder.show_progress_bar = progress.lower() in (
+                "true",
+                "1",
+                "yes",
+                "on",
+            )
 
         if persist := os.getenv("CLEAN_PERSIST_PATH"):
             config.storage.default_persist_dir = persist
