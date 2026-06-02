@@ -175,6 +175,13 @@ make lint      # ruff check + format check
 make format    # apply ruff fixes
 ```
 
+## How the token savings work
+
+Clean is engineered to minimise the tokens an AI agent spends understanding your
+code — via semantic retrieval, tiered result summaries, on-demand expansion, and
+incremental indexing. For a full, code-referenced breakdown of every
+cost-reduction mechanism, see [docs/cost-reduction.md](docs/cost-reduction.md).
+
 ## Contributing
 
 PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
