@@ -1,8 +1,8 @@
-# Clean
+# Clean MCP
 
 > Local semantic code search for AI coding agents — runs on your laptop, indexes stay on disk.
 
-Clean is an [MCP](https://modelcontextprotocol.io) server that gives Claude Code, Cursor, and other AI tools **meaning-aware** code search. It parses your repositories with tree-sitter, builds a call graph, embeds every function with a local sentence-transformer model, and stores everything in [LanceDB](https://lancedb.com) — no cloud, no API keys, no telemetry.
+Clean MCP is an [MCP](https://modelcontextprotocol.io) server that gives Claude Code, Cursor, and other AI tools **meaning-aware** code search. It parses your repositories with tree-sitter, builds a call graph, embeds every function with a local sentence-transformer model, and stores everything in [LanceDB](https://lancedb.com) — no cloud, no API keys, no telemetry.
 
 ```text
 "find the function that validates email on signup"
