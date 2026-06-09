@@ -119,6 +119,49 @@ The net effect: the agent's path to the right code goes from *"read 15 files to
 find 1 function"* to *"receive 1 function (plus its neighbours) directly."* Every
 file that is **not** read is pure savings.
 
+### Why no grep is needed: the index stores the location, not just the vector
+
+The reason a single semantic query can replace grep entirely is that **LanceDB
+does not store bare vectors — it stores the full code record next to each
+vector.** Every entity row carries its own location and relationship metadata, so
+the answer to "where is this?" travels back *with* the similarity match. There is
+never a second step where the agent has to go find the code on disk.
+
+The on-disk schema is defined in `_entity_schema`
+(`src/clean/storage/lancedb.py:28`). Each row holds:
+
+| Column | Purpose |
+|--------|---------|
+| `vector` | The 384-dim embedding that the similarity search matches against. |
+| `file_path` | **The exact file** the entity lives in — returned directly, no grep. |
+| `line_start`, `line_end` | **The exact line range** — so the agent gets `path:start-end` immediately. |
+| `name` | The function/class/method name. |
+| `code` | The full source text of the entity (used later by `expand_result`/tier summaries). |
+| `calls`, `called_by` | JSON-encoded call-graph edges — the neighbours, precomputed. |
+| `language`, `kind`, `sub_kind`, `class_name`, `decorators`, `exported` | Structural metadata for filtering and display. |
+| `id`, `project_id` | Identity and per-repo scoping. |
+| `chunk_index`, `parent_id`, `total_chunks` | Chunking bookkeeping for very large entities. |
+
+So a single approximate-nearest-neighbour query against the `vector` column
+returns rows that **already contain** `file_path`, `line_start`, `line_end`,
+`name`, and the call edges. That is precisely why `search_code`'s response can
+print `auth/signup.py:42-58` with callers and callees attached, with **zero**
+filesystem scanning: the search index *is* the map of the codebase.
+
+LanceDB ranks by L2 distance, which the store converts to a 0–1 similarity score
+(`lancedb.py:329`):
+
+```python
+similarity = 1.0 / (1.0 + distance)
+```
+
+The same stored columns also power the keyword side of hybrid search — name and
+path lookups run as indexed `WHERE` filters over `name` / `file_path`
+(`get_by_name_substring`, `get_by_file_substring`), again with no grep over source
+files. Everything the agent needs to *locate* code is answered from the index
+itself; the actual source files are only ever touched on an explicit
+`expand_result`/`get_source` read.
+
 ---
 
 ## 3. Mechanism 2 — Tiered result formatting

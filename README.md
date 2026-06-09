@@ -83,7 +83,7 @@ CLEAN_PERSIST_PATH=/data/clean/index python -m clean.local.mcp_server
 
 ## Wire it into your MCP client
 
-### Claude Code / Cursor — `.mcp.json` (project-scoped)
+### Claude Code / Cursor / Codex — `.mcp.json` (project-scoped)
 
 ```json
 {
@@ -96,7 +96,15 @@ CLEAN_PERSIST_PATH=/data/clean/index python -m clean.local.mcp_server
 }
 ```
 
-Or globally via the CLI: `claude mcp add clean -- python -m clean.local.mcp_server`
+Or globally via the CLI:
+
+```bash
+# Claude Code
+claude mcp add clean -- python -m clean.local.mcp_server
+
+# Codex
+codex mcp add clean -- python -m clean.local.mcp_server
+```
 
 ## Tools
 
