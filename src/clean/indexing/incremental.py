@@ -56,13 +56,32 @@ class IncrementalIndexer:
         return self._hash_based_diff(current_files, state)
 
     def _try_git_diff(self, root_path: str, stored_head: str | None) -> set[str] | None:
-        """Use git to detect changed files. Returns None if git unavailable."""
+        """Use git to detect changed files from the stored state to the current worktree."""
         if stored_head is None:
             return None
 
         try:
+            changed = set()
+            for args in (
+                ["git", "diff", "--name-only", "--relative", stored_head, "--"],
+                ["git", "diff", "--cached", "--name-only", "--relative", stored_head, "--"],
+            ):
+                result = subprocess.run(
+                    args,
+                    cwd=root_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                if result.returncode != 0:
+                    logger.debug("Git diff failed, falling back to hash-based indexing")
+                    return None
+                for line in result.stdout.splitlines():
+                    if line:
+                        changed.add(os.path.join(root_path, line))
+
             result = subprocess.run(
-                ["git", "diff", "--name-only", f"{stored_head}..HEAD"],
+                ["git", "ls-files", "--others", "--exclude-standard"],
                 cwd=root_path,
                 capture_output=True,
                 text=True,
@@ -70,11 +89,10 @@ class IncrementalIndexer:
             )
             if result.returncode != 0:
                 return None
-
-            changed = set()
-            for line in result.stdout.strip().split("\n"):
+            for line in result.stdout.splitlines():
                 if line:
                     changed.add(os.path.join(root_path, line))
+
             return changed
 
         except (subprocess.TimeoutExpired, FileNotFoundError):
