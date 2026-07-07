@@ -1,6 +1,7 @@
 """Tests for incremental indexing."""
 
 import os
+import subprocess
 import tempfile
 
 import pytest
@@ -57,6 +58,40 @@ def test_incremental_detects_modified_file(project_dir, container):
     r2 = container.indexer.index(project_dir)
     assert r2["status"] == "success"
     assert r2["files_processed"] >= 1  # At least the modified file
+    assert r2.get("incremental") is True
+
+
+def test_incremental_detects_uncommitted_changes_after_restart(project_dir, container):
+    subprocess.run(["git", "init"], cwd=project_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=project_dir,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=project_dir,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=project_dir, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=project_dir,
+        check=True,
+        capture_output=True,
+    )
+
+    r1 = container.indexer.index(project_dir)
+    assert r1["status"] == "success"
+
+    with open(os.path.join(project_dir, "hello.py"), "w") as f:
+        f.write("def hello():\n    return 'dirty hello'\n")
+
+    r2 = container.indexer.index(project_dir)
+    assert r2["status"] == "success"
+    assert r2["files_processed"] >= 1
     assert r2.get("incremental") is True
 
 
